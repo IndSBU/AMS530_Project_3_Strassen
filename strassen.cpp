@@ -1,10 +1,3 @@
-// strassen_rma.cpp
-// Depth-2 Strassen (49 leaves), now using MPI RMA (one-sided MPI_Get) for fetching.
-// - Placement: simple 49-line file (argv[1]), two tokens per line: aRC/bRC or A:aRC/B:bRC
-// - Each rank pins exactly those two blocks, fetches only the extra ~4–6 it needs
-// - No request/serve bottleneck: owners expose a window; requesters pull with MPI_Get
-// - Rank 0 writes result.txt with metrics
-
 #include <mpi.h>
 #include <array>
 #include <vector>
@@ -143,44 +136,6 @@ static void build_owner_from_placement_simple(
     }
 }
 
-// -------------------- RMA window (one-sided) --------------------
-// Expose all 32 base blocks (each 2x2 = 4 doubles) in a single window per rank.
-static std::array<double, 32*4> g_winbuf;  // local exposed memory
-static MPI_Win g_win = MPI_WIN_NULL;
-
-static inline void win_pack_slot(int id, const M2& m){
-    double* p = &g_winbuf[id*4];
-    p[0]=m.v[0][0]; p[1]=m.v[0][1]; p[2]=m.v[1][0]; p[3]=m.v[1][1];
-}
-
-// Pull many ids directly from their owners with MPI_Get, grouped by owner.
-static inline void rma_fetch_many(const std::vector<int>& ids,
-                                  int /*me*/, int world,
-                                  std::unordered_map<int,M2>& out_cache)
-{
-    std::unordered_map<int, std::vector<int>> by_owner;
-    by_owner.reserve(ids.size());
-    for (int id: ids) by_owner[ owner_of(id, world) ].push_back(id);
-
-    // Batch by owner to reduce flushes
-    for (auto& kv : by_owner){
-        int owner = kv.first;
-        auto& v = kv.second;
-
-        // Option A (batched flush): issue gets, then one flush
-        for (int id : v){
-            double buf[4];
-            MPI_Get(buf, 4, MPI_DOUBLE, owner, id*4, 4, MPI_DOUBLE, g_win);
-            MPI_Win_flush(owner, g_win); // keep simple & safe; change to single flush for more perf
-            out_cache[id] = unpack_M2(buf);
-        }
-
-        // If you want tighter batching (fewer flushes), comment the per-id flush above and:
-        // MPI_Win_flush(owner, g_win);
-        // (Then you'd need a temp staging buffer or MPI_Get_accumulate into out_cache directly.)
-    }
-}
-
 // -------------------- Demo block initialization --------------------
 static inline M2 make_block(int seed){
     M2 m{};
@@ -273,6 +228,7 @@ static inline void top_op_for_k(int k,
         case 6: Aparts={{1,+1},{3,-1}}; Bparts={{2,+1},{3,+1}}; break;
     }
 }
+// NOTE: fixed typo in previous line; replace `{3;+1}` with `{3,+1}`
 static inline int Cid_from_qs(int q, int s){
     int qr = (q/2), qc = (q%2);
     int sr = (s/2), sc = (s%2);
@@ -308,6 +264,116 @@ static std::array<Leaf,49> build_depth2_recipes(){
         }
     }
     return Ls; // 49 leaves
+}
+
+// -------------------- P2P fetch: Alltoallv requests + replies --------------------
+static void p2p_fetch_many(const std::vector<int>& remote_ids,
+                           const Store& store,
+                           int me, int world,
+                           std::unordered_map<int,M2>& out_cache)
+{
+    // Group requested ids by owner (exclude self)
+    std::vector<int> send_counts(world, 0);
+    std::vector<std::vector<int>> by_owner(world);
+    for (int id : remote_ids){
+        int ow = OWNER[id];
+        if (ow == me) continue;
+        by_owner[ow].push_back(id);
+    }
+    for (int r=0; r<world; ++r) send_counts[r] = (int)by_owner[r].size();
+
+    // Exchange request counts so owners know how many IDs to expect from each rank
+    std::vector<int> recv_counts(world, 0);
+    MPI_Alltoall(send_counts.data(), 1, MPI_INT,
+                 recv_counts.data(), 1, MPI_INT, MPI_COMM_WORLD);
+
+    // Build send/recv buffers for ID exchange
+    auto prefix = [](const std::vector<int>& v){
+        std::vector<int> p(v.size()+1,0);
+        for (size_t i=0;i<v.size();++i) p[i+1]=p[i]+v[i];
+        return p;
+    };
+    // Flatten ids to send
+    std::vector<int> sdispls(world,0), rdispls(world,0);
+    std::vector<int> send_ids;
+    {
+        int total_send = 0;
+        for (int r=0;r<world;++r) total_send += send_counts[r];
+        send_ids.reserve(total_send);
+        for (int r=0;r<world;++r){
+            sdispls[r] = (int)send_ids.size();
+            send_ids.insert(send_ids.end(), by_owner[r].begin(), by_owner[r].end());
+        }
+        // recv displs
+        int acc=0;
+        for (int r=0;r<world;++r){ rdispls[r]=acc; acc += recv_counts[r]; }
+    }
+    int total_recv_ids = 0;
+    for (int r=0;r<world;++r) total_recv_ids += recv_counts[r];
+    std::vector<int> recv_ids(total_recv_ids, -1);
+
+    // Exchange ID lists: requesters -> owners
+    MPI_Alltoallv(send_ids.data(), send_counts.data(), sdispls.data(), MPI_INT,
+                  recv_ids.data(), recv_counts.data(), rdispls.data(), MPI_INT,
+                  MPI_COMM_WORLD);
+
+    // Owners prepare payloads (4 doubles per requested id, in-place packed in same order)
+    std::vector<int> send_counts_d(world, 0), sdispls_d(world, 0);
+    std::vector<int> recv_counts_d(world, 0), rdispls_d(world, 0);
+
+    // For doubles: counts are 4 * (#ids)
+    for (int r=0;r<world;++r){
+        // I (as owner) will send to rank r as many doubles as they requested from me
+        send_counts_d[r] = 4 * recv_counts[r];
+        // I (as requester) will receive from rank r as many doubles as I asked them for
+        recv_counts_d[r] = 4 * send_counts[r];
+    }
+    // Build displacements for doubles
+    {
+        int acc=0; for (int r=0;r<world;++r){ sdispls_d[r]=acc; acc += send_counts_d[r]; }
+        acc=0; for (int r=0;r<world;++r){ rdispls_d[r]=acc; acc += recv_counts_d[r]; }
+    }
+
+    // Pack send (owner side)
+    std::vector<double> send_data_d( std::accumulate(send_counts_d.begin(), send_counts_d.end(), 0), 0.0 );
+    for (int src=0; src<world; ++src){
+        int n_ids = recv_counts[src];
+        if (n_ids==0) continue;
+        int off_id = rdispls[src];             // where that src's ID segment begins in recv_ids
+        int off_db = sdispls_d[src];           // where to pack doubles for that src
+        for (int i=0;i<n_ids;++i){
+            int id = recv_ids[off_id + i];
+            auto it = store.data.find(id);
+            if (it==store.data.end()){
+                // Should not happen if OWNER table is consistent; send zeros defensively.
+                double* p = &send_data_d[off_db + 4*i];
+                p[0]=p[1]=p[2]=p[3]=0.0;
+            }else{
+                pack_M2(it->second, &send_data_d[off_db + 4*i]);
+            }
+        }
+    }
+
+    // Receive buffer for requested data (requester side)
+    std::vector<double> recv_data_d( std::accumulate(recv_counts_d.begin(), recv_counts_d.end(), 0), 0.0 );
+
+    // Owners -> Requesters: send packed 2x2 blocks (as 4 doubles per id)
+    MPI_Alltoallv(send_data_d.data(), send_counts_d.data(), sdispls_d.data(), MPI_DOUBLE,
+                  recv_data_d.data(), recv_counts_d.data(), rdispls_d.data(), MPI_DOUBLE,
+                  MPI_COMM_WORLD);
+
+    // Unpack on requester side back into cache, following *the same ID order we sent*
+    for (int dst=0; dst<world; ++dst){
+        int n_ids = send_counts[dst];
+        if (n_ids==0) continue;
+        int off_id = sdispls[dst];        // the IDs we sent to that owner
+        int off_db = rdispls_d[dst];      // the doubles we received from that owner
+        for (int i=0;i<n_ids;++i){
+            int id = send_ids[off_id + i];
+            const double* p = &recv_data_d[off_db + 4*i];
+            out_cache[id] = unpack_M2(p);
+        }
+    }
 }
 
 // -------------------- Main --------------------
@@ -349,21 +415,6 @@ int main(int argc, char** argv){
         if (owner_of(id, world) == me)
             store.data[id] = make_block(id+1);
 
-    // ---- RMA window: expose all 32 slots; fill owned slots, zero others
-    for (int id=0; id<32; ++id){
-        if (auto it = store.data.find(id); it != store.data.end())
-            win_pack_slot(id, it->second);
-        else {
-            double* p = &g_winbuf[id*4];
-            p[0]=p[1]=p[2]=p[3]=0.0;
-        }
-    }
-    MPI_Win_create(g_winbuf.data(),
-                   g_winbuf.size()*sizeof(double),
-                   sizeof(double),
-                   MPI_INFO_NULL, MPI_COMM_WORLD, &g_win);
-    MPI_Win_lock_all(MPI_MODE_NOCHECK, g_win);
-
     // Build Strassen depth-2 leaves
     auto recipes = build_depth2_recipes();
 
@@ -392,20 +443,9 @@ int main(int argc, char** argv){
 
         double t0 = MPI_Wtime();
         if (!to_fetch.empty()){
-            // First fill from local store if any slipped in (shouldn't)
-            for (int id: to_fetch){
-                if (auto it=store.data.find(id); it!=store.data.end())
-                    cache[id] = it->second;
-            }
-            // Remaining truly remote
-            std::vector<int> remote_ids;
-            remote_ids.reserve(to_fetch.size());
-            for (int id: to_fetch) if (!cache.count(id)) remote_ids.push_back(id);
-
-            if (!remote_ids.empty()){
-                rma_fetch_many(remote_ids, me, world, cache);
-                approx_bytes_recv += static_cast<unsigned long long>(remote_ids.size()) * sizeof(double) * 4ULL;
-            }
+            // P2P two-phase: send ID lists to owners, receive payloads back.
+            p2p_fetch_many(to_fetch, store, me, world, cache);
+            approx_bytes_recv += static_cast<unsigned long long>(to_fetch.size()) * sizeof(double) * 4ULL;
         }
         double t1 = MPI_Wtime(); t_fetch += (t1 - t0);
 
@@ -467,7 +507,7 @@ int main(int argc, char** argv){
         std::ofstream fout("result.txt");
         fout.setf(std::ios::fixed); fout.precision(6);
 
-        fout << "Result C (8x8 numeric matrix) — depth-2 Strassen (49 leaves, RMA)\n";
+        fout << "Result C (8x8 numeric matrix) — depth-2 Strassen (49 leaves, P2P two-sided)\n";
         for (int r = 0; r < 8; ++r) {
             for (int c = 0; c < 8; ++c) {
                 fout << C[r][c] << (c + 1 < 8 ? ' ' : '\n');
@@ -484,12 +524,6 @@ int main(int argc, char** argv){
         fout.close();
 
         std::printf("Result and metrics written to result.txt\n");
-    }
-
-    // Tear down the RMA window
-    if (g_win != MPI_WIN_NULL){
-        MPI_Win_unlock_all(g_win);
-        MPI_Win_free(&g_win);
     }
 
     MPI_Finalize();
